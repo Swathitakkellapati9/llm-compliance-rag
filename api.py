@@ -1,51 +1,57 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
-from google import genai
 import faiss
 import numpy as np
 import os
-from dotenv import load_dotenv
-
-from src.rag import build_index, retrieve, generate_answer
-
-load_dotenv()
 
 app = FastAPI()
 
-client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+# Load model once
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Load PDF
-text = ""
+# Load PDF text
+def load_text():
+    text = ""
+    for filename in os.listdir("docs"):
+        if filename.endswith(".pdf"):
+            path = os.path.join("docs", filename)
+            reader = PdfReader(path)
+            for page in reader.pages:
+                if page.extract_text():
+                    text += page.extract_text() + "\n"
+    return text
 
-for filename in os.listdir("docs"):
-    if filename.endswith(".pdf"):
-        reader = PdfReader(os.path.join("docs", filename))
-        for page in reader.pages:
-            if page.extract_text():
-                text += page.extract_text() + "\n"
+# Build chunks + index once at startup
+text = load_text()
 
-# Chunking
-splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=200,
+    chunk_overlap=50
+)
+
 chunks = splitter.split_text(text)
 
-# Index
-model, index = build_index(chunks)
+embeddings = model.encode(chunks)
+embeddings = np.array(embeddings).astype("float32")
 
-class Query(BaseModel):
-    question: str
+index = faiss.IndexFlatL2(embeddings.shape[1])
+index.add(embeddings)
+
+@app.get("/")
+def home():
+    return {"status": "API running"}
 
 @app.post("/ask")
-def ask(q: Query):
-    retrieved = retrieve(q.question, model, index, chunks)
-    context = "\n\n".join(retrieved)
+def ask(question: str):
+    query_vec = model.encode([question]).astype("float32")
+    distances, indices = index.search(query_vec, k=3)
 
-    answer = generate_answer(q.question, context, client)
+    retrieved = [chunks[i] for i in indices[0]]
+    answer = "\n\n".join(retrieved)
 
     return {
-        "question": q.question,
-        "answer": answer,
-        "sources": retrieved
+        "question": question,
+        "answer": answer
     }
